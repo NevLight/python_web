@@ -5,7 +5,7 @@ import aiomysql
 def create_pool(loop,**kw):
 	logging.info('create db')
 	global __pool
-	__pool=yield from aiomysql.creat_pool(
+	__pool=yield from aiomysql.create_pool(
 		host=kw.get('host','localhost'),
 		port=kw.get('post',3306),
 		user=kw['user'],
@@ -35,7 +35,7 @@ def select(sql,args,size=None):
 
 @asyncio.coroutine
 def execute(sql,args):
-	log(sql)
+	# log(sql)
 	with (yield from __pool) as conn:
 		try:
 			cur=yield from conn.cursor()
@@ -46,6 +46,11 @@ def execute(sql,args):
 			raise
 		return affected
 
+def create_args_string(num):
+	L=[]
+	for n in range(num):
+		L.append('?')
+	return ','.join(L)
 
 class ModelMetaclass(type):
 	def __new__(cls,name,bases,attrs):
@@ -62,22 +67,22 @@ class ModelMetaclass(type):
 		for k,v in attrs.items():
 			if isinstance(v,Field):
 				logging.info('found mapping: %s => %s' %(k,v))
-				mapping[k]=v
-			if v.primary_key:
-				#找到主键
-				if primaryKey:
-					raise RuntimeError('Duplicate primary key for field: %s' %k)
-				primaryKey=k
-			else:
-				field.append(k)
+				mappings[k]=v
+				if v.primary_key:
+					#找到主键
+					if primaryKey:
+						raise RuntimeError('Duplicate primary key for field: %s' %k)
+					primaryKey=k
+				else:
+					fields.append(k)
 		if not primaryKey:
 			raise RuntimeError('primary key not found')
-		for k in mappings.key():
+		for k in mappings.keys():
 			attrs.pop(k)
 		escaped_fields=list(map(lambda f:'`%s`' %f,fields))
 		attrs['__mappings__']=mappings
 		attrs['__table__']=tableName
-		attrs['primary_key__']=primaryKey
+		attrs['__primary_key__']=primaryKey
 		attrs['__fields__']=fields
 		#sql语句
 		attrs['__select__']='select `%s`, %s from `%s`' %(primaryKey,','.join(escaped_fields),tableName)
@@ -88,7 +93,7 @@ class ModelMetaclass(type):
 
 class Model(dict,metaclass=ModelMetaclass):
 	def __init__(self,**kw):
-		dict.__init__(**kw)
+		dict.__init__(self,**kw)
 	def __getattr__(self,key):
 		try:
 			return self[key]
@@ -110,7 +115,67 @@ class Model(dict,metaclass=ModelMetaclass):
 	@classmethod
 	@asyncio.coroutine
 	def findAll(cls,where=None,args=None,**kw):
-		''
+		sql=[cls.__select__]
+		if where:
+			sql.append('where')
+			sql.append(where)
+		if args is None:
+			args=[]
+		orderBy=kw.get('orderBy',None)
+		if orderBy:
+			sql.append('order by')
+			sql.append(orderBy)
+		limit=kw.get('limit',None)
+		if limit:
+			sql.append('limit')
+			if isinstance(limit,int):
+				sql.append('?')
+				args.append(limit)
+			elif isinstance(limit,tuple) and len(limit)==2:
+				sql.append('?,?')
+				args.extend(limit)
+			else:
+				raise ValueError('Inavlid limit value: %s' %str(limit))
+		rs=yield from select(' '.join(sql),args)
+		return [cls(**r) for r in rs]
+	@classmethod
+	@asyncio.coroutine
+	def findNumber(cls,selectField,where=None,args=None):
+		sql=['select %s _num_ from `%s` % (selectField,cls.__table__)']
+		if where:
+			sql.append('where')
+			sql.append(where)
+		rs=yield from select(' '.join(sql),args,1)
+		if len(rs)==0:
+			return None
+		return rs[0]['_num_']
+	@classmethod
+	@asyncio.coroutine
+	def find(cls,pk):
+		rs=yield from select('%s where `%s`=?' % (cls.__select__,cls.__primary_key__),[pk],1)
+		if len(rs)==0:
+			return None
+		return cls(**rs[0])
+	@asyncio.coroutine
+	def save(self):
+		args=list(map(self.getValueOrDefault,self.__fields__))
+		args.append(self.getValueOrDefault(self.__primary_key__))
+		rows=yield from execute(self.__insert__,args)
+		if rows!=1:
+			logging.warn('failed to insert by primary key:affected rows:%s' %rows)
+	@asyncio.coroutine
+	def update(self):
+		args=list(map(self.getValueOrDefault,self.__fields__))
+		args.append(self.getValue(self.__primary_key__))
+		rows=yield from execute(self.__update__,args)
+		if rows!=1:
+			logging.warn('failed to update by primary ket:affected rows: %s' %rows)
+	@asyncio.coroutine
+	def remove(self):
+		args=[self.getValue(self.__primary_key__)]
+		rows=yield from execute(self.__delete__,args)
+		if rows!=1:
+			logging.warn('failed to remove by primary key: affected rows: %s' %rows)
 
 class Field(object):
 	def __init__(self,name,column_type,primary_key,default):
@@ -122,22 +187,22 @@ class Field(object):
 		return '<%s,%s:%s>' %(self.__class__.__name__,self.column_type,self.name)
 
 class StringField(Field):
-	def __init__(self,name=None,Primary_key=False,default=None,ddl='varchar(100)'):
-		Field.__init__(name,ddl,primary_key,default)
+	def __init__(self,name=None,primary_key=False,default=None,ddl='varchar(100)'):
+		Field.__init__(self,name,ddl,primary_key,default)
 
 class BooleanField(Field):
 	def __init__(self,name=None,default=False):
-		Field.__init__(name,'boolean',False,default)
+		Field.__init__(self,name,'boolean',False,default)
 
 class IntegerField(Field):
 	def __init__(self,name=None,primary_key=False,default=0):
-		Field.__init__(name,'bigint',primary_key,default)
+		Field.__init__(self,name,'bigint',primary_key,default)
 
 class FloatField(Field):
 	def __init__(self,name=None,primary_key=False,default=0.0):
-		Field.__init__(name,'real',primary_key,default)
+		Field.__init__(self,name,'real',primary_key,default)
 
 class TextField(Field):
 	def __init__(self,name=None,default=None):
-		Field.__init__(name,'text',False,default)
+		Field.__init__(self,name,'text',False,default)
 
